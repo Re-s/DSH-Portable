@@ -1053,8 +1053,43 @@ window.__ModuleLoader__.load({
       return { status: 'created', workspaceId: workspace?.workspaceId }
     }
 
+    // WebKitGTK reports Enter as keyCode 229 ('Unidentified') whenever a GTK input-method
+    // context is attached to the webview, even when no composition is in progress. The
+    // upstream composer keymap treats keyCode 229 as 'IME is composing' and silently
+    // consumes the key, so Enter never submits inside the Portable webview while the same
+    // page submits normally in a regular browser. Shift+Enter is unaffected because the
+    // shift branch returns before that check, which matches the reported symptoms.
+    // Normalize only the misreported code, and only when the engine confirms no active
+    // composition, so real IME commits keep their upstream behavior.
+    function installWebviewEnterKeyFix() {
+      if (typeof window.addEventListener !== 'function') return null
+      if (window.__DSH_PORTABLE_ENTER_KEY_FIX__) return null
+      const composing = { active: false }
+      const onCompositionStart = () => { composing.active = true }
+      const onCompositionEnd = () => { composing.active = false }
+      const onKeyDown = event => {
+        if (event.key !== 'Enter' || event.isComposing || composing.active) return
+        if (event.keyCode === 13 || event.which === 13) return
+        const patch = { value: 13, configurable: true, enumerable: true }
+        try { Object.defineProperty(event, 'keyCode', patch) } catch (error) { return }
+        try { Object.defineProperty(event, 'which', patch) } catch (error) { /* keyCode alone is enough */ }
+      }
+      window.addEventListener('compositionstart', onCompositionStart, true)
+      window.addEventListener('compositionend', onCompositionEnd, true)
+      window.addEventListener('keydown', onKeyDown, true)
+      window.__DSH_PORTABLE_ENTER_KEY_FIX__ = true
+      return () => {
+        if (typeof window.removeEventListener !== 'function') return
+        window.removeEventListener('compositionstart', onCompositionStart, true)
+        window.removeEventListener('compositionend', onCompositionEnd, true)
+        window.removeEventListener('keydown', onKeyDown, true)
+        delete window.__DSH_PORTABLE_ENTER_KEY_FIX__
+      }
+    }
+
     function apply(ctx) {
       const host = nativeHostTransport()
+      const stopEnterKeyFix = installWebviewEnterKeyFix()
       if (React?.createElement && React?.useState && React?.useEffect) {
         try {
           const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
@@ -1345,6 +1380,7 @@ window.__ModuleLoader__.load({
 
         return () => {
           active = false
+          stopEnterKeyFix?.()
           if (publishTimer !== null) clearTimeout(publishTimer)
           publishTimer = null
           if (ctx.workspaces?.pickDirectory === nativePickDirectory && typeof originalPickDirectory === 'function') {
